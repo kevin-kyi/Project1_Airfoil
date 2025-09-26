@@ -208,27 +208,56 @@ def airfoil_points_2d(points_xz, chord=1.0):
     """
     return [(p[0] * chord, p[1] * chord) for p in points_xz]
 
+# def make_wing_from_two_sections(af_points, span, chord_root, chord_tip, twist_tip_deg):
+#     """
+#     Create a simple two-section wing (root + tip) and Loft a solid between them.
+#     """
+#     # Root section sketch (on the XZ plane at the origin)
+#     with BuildSketch(Plane.XZ) as root_sk:
+#         Polygon(*airfoil_points_2d(af_points, chord=chord_root))
+
+#     # Calculate the orientation of the tip plane
+#     twist_rad = math.radians(twist_tip_deg)
+#     tip_z_dir = Vector(0, -math.sin(twist_rad), math.cos(twist_rad))
+#     tip_plane = Plane(origin=(0, span, 0), x_dir=(1, 0, 0), z_dir=tip_z_dir)
+    
+#     # Tip section sketch (on the rotated and translated plane)
+#     with BuildSketch(tip_plane) as tip_sk:
+#         Polygon(*airfoil_points_2d(af_points, chord=chord_tip))
+
+#     # Loft the two sketches into a solid wing
+#     with BuildPart() as wing_part:
+#         loft(sections=[root_sk.sketch, tip_sk.sketch])
+        
+#     return wing_part.part
+
+
 def make_wing_from_two_sections(af_points, span, chord_root, chord_tip, twist_tip_deg):
     """
-    Create a simple two-section wing (root + tip) and Loft a solid between them.
+    Two sections: root at y=0 (no twist), tip at y=span rotated about the chord (X-axis through tip LE).
     """
-    # Root section sketch (on the XZ plane at the origin)
+    # --- Root: on global XZ plane (no twist) ---
     with BuildSketch(Plane.XZ) as root_sk:
-        Polygon(*airfoil_points_2d(af_points, chord=chord_root))
+        Polygon(*[(x*chord_root, z*chord_root) for (x, z) in af_points])
+    root = root_sk.sketch  # keep a handle
 
-    # Calculate the orientation of the tip plane
-    twist_rad = math.radians(twist_tip_deg)
-    tip_z_dir = Vector(0, -math.sin(twist_rad), math.cos(twist_rad))
-    tip_plane = Plane(origin=(0, span, 0), x_dir=(1, 0, 0), z_dir=tip_z_dir)
-    
-    # Tip section sketch (on the rotated and translated plane)
-    with BuildSketch(tip_plane) as tip_sk:
-        Polygon(*airfoil_points_2d(af_points, chord=chord_tip))
+    # --- Tip: start with *same* XZ plane, then translate+rotate geometry ---
+    with BuildSketch(Plane.XZ) as tip_sk_raw:
+        Polygon(*[(x*chord_tip, z*chord_tip) for (x, z) in af_points])
+    tip = tip_sk_raw.sketch
 
-    # Loft the two sketches into a solid wing
+    # Move tip to y = span
+    tip = tip.moved(Location(Vector(0, span, 0)))
+
+    # Rotate tip about the X-axis that passes through (0, span, 0).
+    # This is the chord line at the tip (LE at x=0 in your airfoil coords).
+    twist_axis = Axis((0, span, 0), (1, 0, 0))  # point, direction
+    tip = tip.moved(Location(Rotation(axis=twist_axis, angle=twist_tip_deg)))
+
+    # --- Loft between the two sketches ---
     with BuildPart() as wing_part:
-        loft(sections=[root_sk.sketch, tip_sk.sketch])
-        
+        loft([root, tip])
+
     return wing_part.part
 
 def quick_plots(af_points):
