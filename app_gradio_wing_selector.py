@@ -1,26 +1,25 @@
 # app_gradio_wing_selector.py
 # ----------------------------------------------------------------------
 # Gradio app that:
-#  • Downloads your trained selector model from Hugging Face Hub
+#  • Loads your trained selector model from Hugging Face Hub
 #  • Lets a user upload a novel airfoil & polar (optional)
-#  • Lets the user pick an objective: min_cd / max_cl / max_ld
-#  • Generates a candidate set of wings (planform + twist)
+#  • Chooses an objective: min_cd / max_cl / max_ld
+#  • Generates a deterministic set of candidate wings (planform + twist)
 #  • Scores candidates with the selector and returns the best
-#  • Renders a static PNG, an interactive 3D mesh, and exports an ASCII STL
-#  • Returns a JSON summary + placeholder LLM explanation slot
-#  • (NEW) Optional Top-k candidate table + parallel-coords plot
+#  • Renders a static PNG, an interactive 3D mesh, exports an ASCII STL
+#  • Returns a JSON summary + (NEW) quick validation from the polar
+#  • (Existing) Optional Top-k table + parallel-coordinates plot
 # ----------------------------------------------------------------------
 
-import os, sys, io, math, json, importlib, subprocess, tempfile
+import os, sys, io, math, json, importlib, subprocess, tempfile, hashlib
 from typing import Tuple, Dict, List, Optional
 
 # ========================= USER CONFIG =========================
 MODEL_REPO_ID   = "ecopus/wing-selector-mlp"   # <-- your Hub model repo
 HF_TOKEN        = None  # paste token here if the model is private; else leave None for public
 APP_TITLE       = "Transport Wing Selector"
-APP_DESC        = "Upload a novel airfoil & polar. Choose an objective. Get the best wing + PNG/STL + interactive 3D."
+APP_DESC        = "Upload a novel airfoil & polar. Choose an objective. Get the best wing + PNG/STL + interactive 3D + validation."
 N_CANDIDATES    = 160   # number of candidate wings to generate & score
-SEED            = 42    # RNG for reproducibility
 N_STATIONS      = 20    # spanwise stations (must match training)
 PERIM_POINTS    = 256   # perimeter points for smooth loft (resampled)
 # Candidate ranges (SI units; meters & degrees)
@@ -34,6 +33,12 @@ TWIST_ROOT_MIN  = 0.0     # deg
 TWIST_ROOT_MAX  = 2.0     # deg
 TWIST_TIP_MIN   = -6.0    # deg
 TWIST_TIP_MAX   = -2.0    # deg
+
+# Validation defaults
+ALPHA_MIN_DEG   = -6.0
+ALPHA_MAX_DEG   =  8.0
+ALPHA_STEP_DEG  =  0.25
+E0_OSWALD       = 0.85
 # ===============================================================
 
 # ---------------------- Dependency bootstrap ----------------------
@@ -146,6 +151,21 @@ def standardize(X_raw: np.ndarray, means: np.ndarray, stds: np.ndarray) -> np.nd
     X_imp = np.where(np.isfinite(X_raw), X_raw, means)
     return (X_imp - means) / np.where(stds==0, 1.0, stds)
 
+# ---------------------- Reproducible seeding ----------------------
+def deterministic_seed(airfoil_bytes: Optional[bytes], polar_bytes: Optional[bytes],
+                       objective: str, n_cands: int, extra_seed: Optional[int]) -> int:
+    """
+    Returns a stable 64-bit seed from inputs. Same inputs => same seed.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    h.update(objective.encode("utf-8"))
+    h.update(n_cands.to_bytes(4, "little", signed=False))
+    if airfoil_bytes: h.update(airfoil_bytes)
+    if polar_bytes:   h.update(polar_bytes)
+    if extra_seed is not None:
+        h.update(int(extra_seed).to_bytes(8, "little", signed=True))
+    return int.from_bytes(h.digest()[:8], "little", signed=False)
+
 # ---------------------- File parsing helpers ----------------------
 def _read_file_bytes(file_input):
     """
@@ -211,9 +231,15 @@ def resample_closed_perimeter(xb: np.ndarray, yb: np.ndarray, n: int = 256) -> T
     return xi, yi
 
 def parse_polar_file(fobj: Optional[io.BytesIO]) -> Dict[str, float]:
-    """Reads QBlade/XFOIL polar: columns alpha Cl Cd [Cm]. Returns summary metrics."""
+    """
+    Reads QBlade/XFOIL polar: columns alpha Cl Cd [Cm].
+    Returns summary metrics and (NEW) raw arrays 'alpha','Cl','Cd' if present.
+    """
+    base = dict(cl_max=np.nan, cd_min=np.nan, ld_max=np.nan, cla_per_rad=np.nan, alpha0l_deg=np.nan,
+                alpha=None, Cl=None, Cd=None)
     if fobj is None:
-        return dict(cl_max=np.nan, cd_min=np.nan, ld_max=np.nan, cla_per_rad=np.nan, alpha0l_deg=np.nan)
+        return base
+
     raw = fobj.read().decode("utf-8", errors="ignore").strip().splitlines()
     rows = []
     for line in raw:
@@ -228,20 +254,22 @@ def parse_polar_file(fobj: Optional[io.BytesIO]) -> Dict[str, float]:
         if len(nums) >= 3:
             rows.append(nums[:4])  # alpha, Cl, Cd, [Cm]
     if not rows:
-        return dict(cl_max=np.nan, cd_min=np.nan, ld_max=np.nan, cla_per_rad=np.nan, alpha0l_deg=np.nan)
+        return base
+
     A = np.array(rows, dtype=float)
     alpha = A[:,0]; Cl = A[:,1]; Cd = A[:,2]
     # dedupe/sort by alpha
-    uniq, idx = np.unique(alpha, return_index=True)
+    _, idx = np.unique(alpha, return_index=True)
     alpha = alpha[idx]; Cl = Cl[idx]; Cd = Cd[idx]
     order = np.argsort(alpha)
     alpha = alpha[order]; Cl = Cl[order]; Cd = Cd[order]
-    # summaries
+
     with np.errstate(divide="ignore", invalid="ignore"):
         ld = Cl / Cd
     cl_max = np.nanmax(Cl) if Cl.size else np.nan
     cd_min = np.nanmin(Cd) if Cd.size else np.nan
     ld_max = np.nanmax(ld) if ld.size else np.nan
+
     # linear fit near 0 deg
     mask = (alpha >= -5.0) & (alpha <= 5.0)
     if np.sum(mask) >= 3:
@@ -251,12 +279,14 @@ def parse_polar_file(fobj: Optional[io.BytesIO]) -> Dict[str, float]:
         alpha0l_deg = -b / m if m != 0 else np.nan
     else:
         cla_per_rad = np.nan; alpha0l_deg = np.nan
-    return dict(cl_max=float(cl_max), cd_min=float(cd_min), ld_max=float(ld_max),
-                cla_per_rad=float(cla_per_rad), alpha0l_deg=float(alpha0l_deg))
+
+    return dict(
+        cl_max=float(cl_max), cd_min=float(cd_min), ld_max=float(ld_max),
+        cla_per_rad=float(cla_per_rad), alpha0l_deg=float(alpha0l_deg),
+        alpha=alpha, Cl=Cl, Cd=Cd
+    )
 
 # ------------------------ Geometry generators ------------------------
-rng = np.random.default_rng(SEED)
-
 def schrenk_chord(y: np.ndarray, s: float, c_root: float, c_tip: float) -> np.ndarray:
     c_trap = c_root + (c_tip - c_root) * (y / s)
     c_ell  = c_root * np.sqrt(np.maximum(0.0, 1.0 - (y / s)**2))
@@ -264,7 +294,7 @@ def schrenk_chord(y: np.ndarray, s: float, c_root: float, c_tip: float) -> np.nd
     clamp = 0.25 * np.min(c_trap)
     return np.maximum(c, clamp)
 
-def planform_sample(n: int) -> List[Dict]:
+def planform_sample(n: int, rng: np.random.Generator) -> List[Dict]:
     out = []
     for _ in range(n):
         s   = float(rng.uniform(HALFSPAN_MIN_M, HALFSPAN_MAX_M))
@@ -365,8 +395,7 @@ def _mesh_vertices_faces(S_all, Y_all, Z_all):
 
     # Add caps
     root_center = np.array([S[0].mean(),   Y[0].mean(),   Z[0].mean()], dtype=float)
-    tip_center  = np.array([S[-1].mean()], dtype=float)
-    tip_center  = np.array([S[-1].mean(),  Y[-1].mean(),  Z[-1].mean()], dtype=float)  # fixed line
+    tip_center  = np.array([S[-1].mean(),  Y[-1].mean(),  Z[-1].mean()], dtype=float)
 
     rc_idx = len(V);  tc_idx = len(V) + 1
     V = np.vstack([V, root_center, tip_center])
@@ -463,15 +492,14 @@ def score_candidates(model_pack: Dict, feats: np.ndarray, objective: str) -> np.
     X = torch.tensor(X_std, dtype=torch.float32, device=next(model.parameters()).device)
     obj_id = OBJECTIVES.index(objective)
     obj_ids = torch.full((X.size(0),), obj_id, dtype=torch.long, device=X.device)
-    # Unknown novel airfoil -> use airfoil_id=0 (shared embedding). This is a limitation of the trained model.
+    # Unknown novel airfoil -> use airfoil_id=0 (shared embedding).
     af_ids  = torch.zeros((X.size(0),), dtype=torch.long, device=X.device)
     with torch.no_grad():
         probs = torch.sigmoid(model(X, obj_ids, af_ids)).cpu().numpy()
     return probs
 
-# ---------------------- Top-k utilities (NEW) ----------------------
+# ---------------------- Top-k utilities ----------------------
 def _topk_table_and_parallel(plans: List[Dict], probs: np.ndarray, k: int, objective: str):
-    """Build a pandas table (top-k) and a parallel-coords Plotly figure."""
     order = np.argsort(probs)[::-1]  # descending
     k = int(max(1, min(k, len(order))))
     sel = order[:k]
@@ -496,10 +524,8 @@ def _topk_table_and_parallel(plans: List[Dict], probs: np.ndarray, k: int, objec
         ))
     df = pd.DataFrame(rows)
 
-    # Parallel-coords on a compact set of informative features
     if not df.empty:
         pc_cols = ["span_m", "taper", "area_m2", "aspect_ratio", "mac_m", "washout_deg"]
-        # Normalize each column to [0,1] for display
         df_norm = df.copy()
         for c in pc_cols:
             v = df_norm[c].values.astype(float)
@@ -507,11 +533,11 @@ def _topk_table_and_parallel(plans: List[Dict], probs: np.ndarray, k: int, objec
             if vmax > vmin:
                 df_norm[c] = (v - vmin) / (vmax - vmin)
             else:
-                df_norm[c] = 0.5  # flat column
+                df_norm[c] = 0.5
         fig = px.parallel_coordinates(
             df_norm,
             dimensions=pc_cols,
-            color=df["score"],  # color by true score
+            color=df["score"],
             color_continuous_scale=px.colors.sequential.Viridis,
             labels={c: c for c in pc_cols},
             title=f"Top-{k} candidates for {objective} (normalized)"
@@ -522,8 +548,138 @@ def _topk_table_and_parallel(plans: List[Dict], probs: np.ndarray, k: int, objec
 
     return df, fig
 
+# --------------------- Quick validation (proxy) ---------------------
+def _interp_cl_cd(polar: Dict, alpha_deg: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Interpolate Cl, Cd from polar arrays; clamp outside data range."""
+    a = polar.get("alpha", None)
+    Cl = polar.get("Cl", None)
+    Cd = polar.get("Cd", None)
+    if a is None or Cl is None or Cd is None:
+        # No polar → return NaNs
+        return np.full_like(alpha_deg, np.nan), np.full_like(alpha_deg, np.nan)
+    a = np.asarray(a); Cl = np.asarray(Cl); Cd = np.asarray(Cd)
+    a_min, a_max = float(a.min()), float(a.max())
+    # Clamp outside:
+    alpha_use = np.clip(alpha_deg, a_min, a_max)
+    cl = np.interp(alpha_use, a, Cl)
+    cd = np.interp(alpha_use, a, Cd)
+    return cl, cd
+
+def _wing_coeffs_from_polar(pl: Dict, polar: Dict, aoa_root_deg: float, e0: float) -> Tuple[float,float,float]:
+    """
+    Strip-theory CL and profile CD from polar at local alpha=aoa_root - twist(y).
+    Total CD = profile + induced (CL^2 / (pi*AR*e0)).
+    Returns (CL_total, CD_total, LD).
+    """
+    y = pl["y"]; c = pl["cvec"]; twist = pl["twist"]
+    S_full = planform_metrics(y, c, pl["s"])["area_m2"]
+    AR     = planform_metrics(y, c, pl["s"])["aspect_ratio"]
+
+    # local section alpha (deg)
+    alpha_loc = aoa_root_deg - twist
+    cl_loc, cd_loc = _interp_cl_cd(polar, alpha_loc)
+    if np.isnan(cl_loc).all() or np.isnan(cd_loc).all():
+        return np.nan, np.nan, np.nan
+
+    # half-span integrals → full-wing coefficients
+    int_clc = float(np.trapz(cl_loc * c, y))
+    int_cdc = float(np.trapz(cd_loc * c, y))
+    CL = 2.0 * int_clc / S_full
+    CD_profile = 2.0 * int_cdc / S_full
+    CD_induced = (CL*CL) / (math.pi * AR * max(e0, 1e-6))
+    CD_total   = CD_profile + CD_induced
+    LD = CL / CD_total if CD_total > 0 else np.nan
+    return CL, CD_total, LD
+
+def validate_selected_wing(pl: Dict, polar: Dict,
+                           alpha_min=ALPHA_MIN_DEG, alpha_max=ALPHA_MAX_DEG, alpha_step=ALPHA_STEP_DEG,
+                           e0=E0_OSWALD) -> Dict:
+    """
+    Sweep aoa_root across [alpha_min, alpha_max] and find best for each objective.
+    Returns dict with per-objective best alpha and metrics, plus the full curves.
+    """
+    alphas = np.arange(alpha_min, alpha_max + 1e-9, alpha_step)
+    CLs, CDs, LDs = [], [], []
+    for a0 in alphas:
+        CL, CD, LD = _wing_coeffs_from_polar(pl, polar, a0, e0)
+        CLs.append(CL); CDs.append(CD); LDs.append(LD)
+    CLs = np.array(CLs); CDs = np.array(CDs); LDs = np.array(LDs)
+
+    out = {"alphas": alphas, "CL": CLs, "CDtot": CDs, "LD": LDs}
+    # min_cd
+    if np.isfinite(CDs).any():
+        i_cd = int(np.nanargmin(CDs)); out["min_cd"] = {"alpha_deg": float(alphas[i_cd]), "CL": float(CLs[i_cd]), "CD": float(CDs[i_cd]), "LD": float(LDs[i_cd])}
+    else:
+        out["min_cd"] = {"alpha_deg": np.nan, "CL": np.nan, "CD": np.nan, "LD": np.nan}
+    # max_cl
+    if np.isfinite(CLs).any():
+        i_cl = int(np.nanargmax(CLs)); out["max_cl"] = {"alpha_deg": float(alphas[i_cl]), "CL": float(CLs[i_cl]), "CD": float(CDs[i_cl]), "LD": float(LDs[i_cl])}
+    else:
+        out["max_cl"] = {"alpha_deg": np.nan, "CL": np.nan, "CD": np.nan, "LD": np.nan}
+    # max_ld
+    if np.isfinite(LDs).any():
+        i_ld = int(np.nanargmax(LDs)); out["max_ld"] = {"alpha_deg": float(alphas[i_ld]), "CL": float(CLs[i_ld]), "CD": float(CDs[i_ld]), "LD": float(LDs[i_ld])}
+    else:
+        out["max_ld"] = {"alpha_deg": np.nan, "CL": np.nan, "CD": np.nan, "LD": np.nan}
+    return out
+
+def _validation_table(vres: Dict) -> pd.DataFrame:
+    rows = []
+    for obj in OBJECTIVES:
+        m = vres.get(obj, {})
+        rows.append(dict(
+            objective=obj,
+            alpha_deg=m.get("alpha_deg", np.nan),
+            CL=m.get("CL", np.nan),
+            CD_total=m.get("CD", np.nan),
+            LD=m.get("LD", np.nan),
+        ))
+    return pd.DataFrame(rows)
+
+def _validation_plot(vres: Dict) -> go.Figure:
+    al = vres.get("alphas", None)
+    CL = vres.get("CL", None)
+    CD = vres.get("CDtot", None)
+    LD = vres.get("LD", None)
+
+    fig = go.Figure()
+
+    if al is None or CL is None:
+        fig.update_layout(title="Validation: no polar provided")
+        return fig
+
+    # Left axis: CL
+    fig.add_trace(go.Scatter(x=al, y=CL, mode="lines", name="CL"))
+
+    # Right axis (primary): CD_total
+    if CD is not None and np.isfinite(CD).any():
+        fig.add_trace(go.Scatter(x=al, y=CD, mode="lines", name="CD_total", yaxis="y2"))
+
+    # Right axis (secondary): L/D
+    if LD is not None and np.isfinite(LD).any():
+        fig.add_trace(go.Scatter(x=al, y=LD, mode="lines", name="L/D", yaxis="y3"))
+
+    # Axes layout:
+    # yaxis  = left (CL)
+    # yaxis2 = right (CD_total)
+    # yaxis3 = right (L/D) anchored 'free' at position=1.0 (must be within [0,1])
+    fig.update_layout(
+        title="Wing-level curves vs AoA (root)",
+        xaxis_title="α_root (deg)",
+        yaxis=dict(title="CL"),
+        yaxis2=dict(title="CD_total", overlaying="y", side="right"),
+        yaxis3=dict(title="L/D", overlaying="y", side="right", anchor="free", position=1.0),
+        legend=dict(orientation="h"),
+        margin=dict(l=60, r=140, t=50, b=50)  # extra right margin for two right-side axes
+    )
+    return fig
+
+
 # --------------------------- Gradio fn ---------------------------
-def find_best_wing(airfoil_file, polar_file, objective, show_topk, topk_k):
+def find_best_wing(airfoil_file, polar_file, objective,
+                   show_topk, topk_k,
+                   deterministic, extra_seed,
+                   run_validation, alpha_min, alpha_max, alpha_step, e0_oswald):
     try:
         if HF_TOKEN and not os.getenv("HF_TOKEN"):
             os.environ["HF_TOKEN"] = HF_TOKEN
@@ -533,18 +689,30 @@ def find_best_wing(airfoil_file, polar_file, objective, show_topk, topk_k):
         # Parse airfoil (required)
         airfoil_bytes = _read_file_bytes(airfoil_file)
         if airfoil_bytes is None:
-            return None, None, None, None, json.dumps({"error":"Please upload an airfoil .dat/.txt"}), "No explanation (LLM placeholder).", None, None
+            err = {"error":"Please upload an airfoil .dat/.txt (two columns x y)."}
+            return None, None, None, None, json.dumps(err), "No explanation.", None, None, None, None
         xb, yb = parse_airfoil_file(io.BytesIO(airfoil_bytes))
         xb, yb = resample_closed_perimeter(xb, yb, n=PERIM_POINTS)
 
-        # Parse polar (optional)
-        polar_metrics = dict(cl_max=np.nan, cd_min=np.nan, ld_max=np.nan, cla_per_rad=np.nan, alpha0l_deg=np.nan)
+        # Parse polar (optional) – now returns arrays too
         polar_bytes = _read_file_bytes(polar_file)
+        polar_metrics = dict(cl_max=np.nan, cd_min=np.nan, ld_max=np.nan, cla_per_rad=np.nan, alpha0l_deg=np.nan,
+                             alpha=None, Cl=None, Cd=None)
         if polar_bytes is not None:
             polar_metrics = parse_polar_file(io.BytesIO(polar_bytes))
 
+        # ---- Deterministic candidate generation
+        seed = deterministic_seed(
+            airfoil_bytes=airfoil_bytes,
+            polar_bytes=polar_bytes,
+            objective=objective,
+            n_cands=N_CANDIDATES,
+            extra_seed=int(extra_seed) if (extra_seed not in (None, "")) else None
+        ) if deterministic else None
+        rng = np.random.default_rng(seed) if seed is not None else np.random.default_rng()
+
         # Generate candidates and features
-        plans = planform_sample(N_CANDIDATES)
+        plans = planform_sample(N_CANDIDATES, rng=rng)
         feats = np.stack([extract_features_for_candidate(pl, polar_metrics) for pl in plans], axis=0)
 
         # Score & select best
@@ -580,17 +748,19 @@ def find_best_wing(airfoil_file, polar_file, objective, show_topk, topk_k):
             "mac_m": float(mets["mac_m"]),
             "twist_root_deg": float(pl["twist"][0]),
             "twist_tip_deg": float(pl["twist"][-1]),
-            "polar_summaries_used": polar_metrics,
+            "deterministic_seed": seed if deterministic else None,
+            "polar_summaries_used": {k: float(v) if isinstance(v, (int,float,np.floating)) else None
+                                     for k,v in polar_metrics.items() if k in ["cl_max","cd_min","ld_max","cla_per_rad","alpha0l_deg"]},
             "notes": "Airfoil embedding set to id=0 for novel airfoils (model limitation).",
         }
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, indent=2)
 
         explanation = (
-            "Explanation (placeholder): The selector evaluated a grid of candidate planforms using your airfoil. "
+            "The selector evaluated a deterministic set of candidate planforms using your airfoil. "
             "It standardized features (span, area, MAC, taper, twist stats, and polar summaries) and predicted the "
-            f"likelihood of being best for objective '{objective}'. The returned wing maximized that score and is "
-            "rendered above. A future LLM can narrate the tradeoffs and geometry rationale."
+            f"likelihood of being best for objective '{objective}'. The returned wing maximized that score. "
+            "Validation estimates wing-level CL, CD_total, and L/D using your polar with a strip-theory + induced-drag proxy."
         )
 
         # Top-k outputs (optional)
@@ -599,12 +769,26 @@ def find_best_wing(airfoil_file, polar_file, objective, show_topk, topk_k):
         else:
             topk_df, topk_fig = None, None
 
-        # Return: PNG, Interactive Plotly, STL, JSON (file), pretty JSON (string), explanation, Top-k table, Top-k plot
-        return png_path, fig3d, stl_path, json_path, json.dumps(summary, indent=2), explanation, topk_df, topk_fig
+        # Quick validation (optional; only if polar present)
+        if bool(run_validation) and (polar_metrics.get("alpha") is not None):
+            vres = validate_selected_wing(pl, polar_metrics,
+                                          alpha_min=float(alpha_min), alpha_max=float(alpha_max),
+                                          alpha_step=float(alpha_step), e0=float(e0_oswald))
+            vtable = _validation_table(vres)
+            vplot  = _validation_plot(vres)
+        else:
+            vres, vtable, vplot = None, None, None
+
+        # Return:
+        # PNG, Interactive, STL, JSON file, pretty JSON text, explanation,
+        # topk table, topk plot, validation table, validation plot
+        return (png_path, fig3d, stl_path, json_path,
+                json.dumps(summary, indent=2), explanation,
+                topk_df, topk_fig, vtable, vplot)
 
     except Exception as e:
         err = {"error": str(e)}
-        return None, None, None, None, json.dumps(err), "No explanation (LLM placeholder).", None, None
+        return None, None, None, None, json.dumps(err), "No explanation.", None, None, None, None
 
 # --------------------------- Gradio UI ---------------------------
 with gr.Blocks(title=APP_TITLE) as demo:
@@ -628,6 +812,17 @@ with gr.Blocks(title=APP_TITLE) as demo:
         show_topk = gr.Checkbox(value=False, label="Show top-k candidates")
         topk_k    = gr.Slider(minimum=2, maximum=20, value=5, step=1, label="k (top-k)")
 
+    with gr.Row():
+        deterministic = gr.Checkbox(value=True, label="Deterministic (same inputs → same wing)")
+        extra_seed    = gr.Number(value=None, precision=0, label="Extra seed (optional integer)")
+
+    with gr.Row():
+        run_validation = gr.Checkbox(value=True, label="Run quick validation (requires polar)")
+        alpha_min = gr.Number(value=ALPHA_MIN_DEG, label="Validation α_min (deg)")
+        alpha_max = gr.Number(value=ALPHA_MAX_DEG, label="Validation α_max (deg)")
+        alpha_step= gr.Number(value=ALPHA_STEP_DEG, label="Validation α_step (deg)")
+        e0_oswald= gr.Number(value=E0_OSWALD, label="Oswald factor e₀")
+
     run_btn = gr.Button("Find Best Wing", variant="primary")
 
     with gr.Row():
@@ -649,10 +844,21 @@ with gr.Blocks(title=APP_TITLE) as demo:
     with gr.Row():
         topk_plot  = gr.Plot(label="Top-k Parallel-Coordinates (normalized)")
 
+    gr.Markdown("### Quick validation (proxy)")
+    with gr.Row():
+        val_table = gr.Dataframe(label="Validation (per objective)", interactive=False)
+    with gr.Row():
+        val_plot  = gr.Plot(label="Validation curves (CL, CD_total, L/D vs α)")
+
     run_btn.click(
         fn=find_best_wing,
-        inputs=[airfoil_input, polar_input, objective, show_topk, topk_k],
-        outputs=[img_out, plot_out, stl_out, json_out, summary_pretty, explanation_box, topk_table, topk_plot]
+        inputs=[airfoil_input, polar_input, objective,
+                show_topk, topk_k,
+                deterministic, extra_seed,
+                run_validation, alpha_min, alpha_max, alpha_step, e0_oswald],
+        outputs=[img_out, plot_out, stl_out, json_out,
+                 summary_pretty, explanation_box,
+                 topk_table, topk_plot, val_table, val_plot]
     )
 
 if __name__ == "__main__":
