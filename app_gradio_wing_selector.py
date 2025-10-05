@@ -2,14 +2,13 @@
 # ----------------------------------------------------------------------
 # Gradio app that:
 #  • Downloads your trained selector model from Hugging Face Hub
-#  • Lets a user upload a novel airfoil perimeter and (optionally) a polar file
+#  • Lets a user upload a novel airfoil & polar (optional)
 #  • Lets the user pick an objective: min_cd / max_cl / max_ld
 #  • Generates a candidate set of wings (planform + twist)
 #  • Scores candidates with the selector and returns the best
-#  • Renders a static PNG, an interactive Plotly 3D mesh, and exports an ASCII STL
+#  • Renders a static PNG, an interactive 3D mesh, and exports an ASCII STL
 #  • Returns a JSON summary + placeholder LLM explanation slot
-#
-# Run directly in VS Code (no shell commands needed).
+#  • (NEW) Optional Top-k candidate table + parallel-coords plot
 # ----------------------------------------------------------------------
 
 import os, sys, io, math, json, importlib, subprocess, tempfile
@@ -53,7 +52,7 @@ def _pip_install(*pkgs: str, index_url: Optional[str] = None):
 
 def ensure_deps():
     base = []
-    for p in ("numpy", "matplotlib", "gradio", "huggingface_hub", "plotly", "torch"):
+    for p in ("numpy", "matplotlib", "gradio", "huggingface_hub", "plotly", "torch", "pandas"):
         if _need(p): base.append(p)
     if base:
         # Use CPU wheel for torch by default
@@ -72,6 +71,7 @@ except Exception as _e:
     print("[WARN] Dependency install encountered an issue:", _e)
 
 import numpy as np
+import pandas as pd
 import torch, torch.nn as nn
 from huggingface_hub import snapshot_download
 import matplotlib
@@ -80,6 +80,7 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import gradio as gr
 import plotly.graph_objects as go
+import plotly.express as px
 
 # --------------------------- Model defs ---------------------------
 OBJECTIVES = ["min_cd", "max_cl", "max_ld"]
@@ -364,7 +365,9 @@ def _mesh_vertices_faces(S_all, Y_all, Z_all):
 
     # Add caps
     root_center = np.array([S[0].mean(),   Y[0].mean(),   Z[0].mean()], dtype=float)
-    tip_center  = np.array([S[-1].mean(),  Y[-1].mean(),  Z[-1].mean()], dtype=float)
+    tip_center  = np.array([S[-1].mean()], dtype=float)
+    tip_center  = np.array([S[-1].mean(),  Y[-1].mean(),  Z[-1].mean()], dtype=float)  # fixed line
+
     rc_idx = len(V);  tc_idx = len(V) + 1
     V = np.vstack([V, root_center, tip_center])
     for k in range(Meff):
@@ -419,7 +422,6 @@ def make_interactive_plot(S_all, Y_all, Z_all, pl: Dict, objective: str):
             opacity=0.35, showlegend=False
         ))
 
-    # Axes & camera
     fig.update_scenes(
         xaxis_title="Span S (m)", yaxis_title="Y (m)", zaxis_title="Z (m)",
         aspectmode="data",
@@ -467,8 +469,61 @@ def score_candidates(model_pack: Dict, feats: np.ndarray, objective: str) -> np.
         probs = torch.sigmoid(model(X, obj_ids, af_ids)).cpu().numpy()
     return probs
 
+# ---------------------- Top-k utilities (NEW) ----------------------
+def _topk_table_and_parallel(plans: List[Dict], probs: np.ndarray, k: int, objective: str):
+    """Build a pandas table (top-k) and a parallel-coords Plotly figure."""
+    order = np.argsort(probs)[::-1]  # descending
+    k = int(max(1, min(k, len(order))))
+    sel = order[:k]
+
+    rows = []
+    for idx in sel:
+        pl = plans[idx]
+        mets = planform_metrics(pl["y"], pl["cvec"], pl["s"])
+        rows.append(dict(
+            rank=len(rows)+1,
+            score=float(probs[idx]),
+            span_m=float(2.0*pl["s"]),
+            c_root_m=float(pl["c_root"]),
+            c_tip_m=float(pl["c_tip"]),
+            taper=float(pl["taper"]),
+            area_m2=float(mets["area_m2"]),
+            aspect_ratio=float(mets["aspect_ratio"]),
+            mac_m=float(mets["mac_m"]),
+            twist_root_deg=float(pl["twist"][0]),
+            twist_tip_deg=float(pl["twist"][-1]),
+            washout_deg=float(pl["twist"][-1] - pl["twist"][0]),
+        ))
+    df = pd.DataFrame(rows)
+
+    # Parallel-coords on a compact set of informative features
+    if not df.empty:
+        pc_cols = ["span_m", "taper", "area_m2", "aspect_ratio", "mac_m", "washout_deg"]
+        # Normalize each column to [0,1] for display
+        df_norm = df.copy()
+        for c in pc_cols:
+            v = df_norm[c].values.astype(float)
+            vmin, vmax = float(np.min(v)), float(np.max(v))
+            if vmax > vmin:
+                df_norm[c] = (v - vmin) / (vmax - vmin)
+            else:
+                df_norm[c] = 0.5  # flat column
+        fig = px.parallel_coordinates(
+            df_norm,
+            dimensions=pc_cols,
+            color=df["score"],  # color by true score
+            color_continuous_scale=px.colors.sequential.Viridis,
+            labels={c: c for c in pc_cols},
+            title=f"Top-{k} candidates for {objective} (normalized)"
+        )
+        fig.update_layout(margin=dict(l=30, r=30, t=50, b=30))
+    else:
+        fig = go.Figure()
+
+    return df, fig
+
 # --------------------------- Gradio fn ---------------------------
-def find_best_wing(airfoil_file, polar_file, objective):
+def find_best_wing(airfoil_file, polar_file, objective, show_topk, topk_k):
     try:
         if HF_TOKEN and not os.getenv("HF_TOKEN"):
             os.environ["HF_TOKEN"] = HF_TOKEN
@@ -478,7 +533,7 @@ def find_best_wing(airfoil_file, polar_file, objective):
         # Parse airfoil (required)
         airfoil_bytes = _read_file_bytes(airfoil_file)
         if airfoil_bytes is None:
-            return None, None, None, None, json.dumps({"error":"Please upload an airfoil .dat/.txt"}), "No explanation (LLM placeholder)."
+            return None, None, None, None, json.dumps({"error":"Please upload an airfoil .dat/.txt"}), "No explanation (LLM placeholder).", None, None
         xb, yb = parse_airfoil_file(io.BytesIO(airfoil_bytes))
         xb, yb = resample_closed_perimeter(xb, yb, n=PERIM_POINTS)
 
@@ -494,8 +549,8 @@ def find_best_wing(airfoil_file, polar_file, objective):
 
         # Score & select best
         probs = score_candidates(mp, feats, objective)
-        k = int(np.argmax(probs))
-        pl = plans[k]
+        kbest = int(np.argmax(probs))
+        pl = plans[kbest]
         mets = planform_metrics(pl["y"], pl["cvec"], pl["s"])
         dis_m   = pl["y"]
         chord_m = pl["cvec"]
@@ -514,7 +569,7 @@ def find_best_wing(airfoil_file, polar_file, objective):
         # Summary JSON
         summary = {
             "objective": objective,
-            "selector_prob": float(probs[k]),
+            "selector_prob": float(probs[kbest]),
             "half_span_m": float(pl["s"]),
             "span_m": float(2.0*pl["s"]),
             "root_chord_m": float(pl["c_root"]),
@@ -538,12 +593,18 @@ def find_best_wing(airfoil_file, polar_file, objective):
             "rendered above. A future LLM can narrate the tradeoffs and geometry rationale."
         )
 
-        # Return: PNG, Interactive Plotly, STL, JSON (file), pretty JSON (string), explanation
-        return png_path, fig3d, stl_path, json_path, json.dumps(summary, indent=2), explanation
+        # Top-k outputs (optional)
+        if bool(show_topk):
+            topk_df, topk_fig = _topk_table_and_parallel(plans, probs, int(topk_k), objective)
+        else:
+            topk_df, topk_fig = None, None
+
+        # Return: PNG, Interactive Plotly, STL, JSON (file), pretty JSON (string), explanation, Top-k table, Top-k plot
+        return png_path, fig3d, stl_path, json_path, json.dumps(summary, indent=2), explanation, topk_df, topk_fig
 
     except Exception as e:
         err = {"error": str(e)}
-        return None, None, None, None, json.dumps(err), "No explanation (LLM placeholder)."
+        return None, None, None, None, json.dumps(err), "No explanation (LLM placeholder).", None, None
 
 # --------------------------- Gradio UI ---------------------------
 with gr.Blocks(title=APP_TITLE) as demo:
@@ -563,25 +624,35 @@ with gr.Blocks(title=APP_TITLE) as demo:
 
     objective = gr.Dropdown(choices=OBJECTIVES, value="min_cd", label="Objective")
 
+    with gr.Row():
+        show_topk = gr.Checkbox(value=False, label="Show top-k candidates")
+        topk_k    = gr.Slider(minimum=2, maximum=20, value=5, step=1, label="k (top-k)")
+
     run_btn = gr.Button("Find Best Wing", variant="primary")
 
     with gr.Row():
-        img_out = gr.Image(label="Static 3D Render (PNG)", type="filepath")
+        img_out  = gr.Image(label="Static 3D Render (PNG)", type="filepath")
         plot_out = gr.Plot(label="Interactive 3D (orbit/zoom)")
 
     with gr.Row():
-        stl_out = gr.File(label="STL Export")
-        json_out= gr.File(label="Best Wing Summary (JSON)")
+        stl_out  = gr.File(label="STL Export")
+        json_out = gr.File(label="Best Wing Summary (JSON)")
 
     with gr.Row():
         summary_pretty = gr.Code(label="Summary (pretty JSON)", language="json")
     with gr.Row():
         explanation_box = gr.Textbox(label="Model Explanation (LLM slot)", lines=5)
 
+    gr.Markdown("### Optional: Top-k candidate preview")
+    with gr.Row():
+        topk_table = gr.Dataframe(label="Top-k candidates (sorted by score)", interactive=False)
+    with gr.Row():
+        topk_plot  = gr.Plot(label="Top-k Parallel-Coordinates (normalized)")
+
     run_btn.click(
         fn=find_best_wing,
-        inputs=[airfoil_input, polar_input, objective],
-        outputs=[img_out, plot_out, stl_out, json_out, summary_pretty, explanation_box]
+        inputs=[airfoil_input, polar_input, objective, show_topk, topk_k],
+        outputs=[img_out, plot_out, stl_out, json_out, summary_pretty, explanation_box, topk_table, topk_plot]
     )
 
 if __name__ == "__main__":
