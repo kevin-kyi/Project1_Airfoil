@@ -1,7 +1,7 @@
 # Project1_Airfoil
 
 
-# ✈️ Transport Wing Selector — AI-Assisted Wing Design
+# Transport Wing Selector — AI-Assisted Wing Design
 
 An **AI-driven design tool** that automates 3D wing generation from a 2D airfoil and optional polar data.  
 The system evaluates 160 candidate wings using a trained **multilayer perceptron (MLP)** selector model and returns the best geometry based on your chosen aerodynamic objective:
@@ -13,7 +13,7 @@ It converts a traditionally slow, intuition-based process into a transparent, in
 
 ---
 
-## 🚀 What This App Does
+## What This App Does
 - **Generates** candidate 3D wing geometries from a user-provided 2D airfoil (.dat/.txt)  
 - **Scores and ranks** each design across lift, drag, and efficiency objectives  
 - **Selects the top candidate**, visualizing it as:
@@ -26,7 +26,7 @@ It converts a traditionally slow, intuition-based process into a transparent, in
 
 ---
 
-## 🧠 How It Works
+## How It Works
 1. **Input:** Upload your airfoil geometry (and optional polar data).  
 2. **Objective:** Choose your design target (min_cd, max_cl, or max_ld).  
 3. **Candidate Generation:**  
@@ -40,7 +40,7 @@ It converts a traditionally slow, intuition-based process into a transparent, in
 
 ---
 
-## 🧩 Features
+## Features
 | Feature | Description |
 |----------|-------------|
 | **Objective Selection** | min_cd / max_cl / max_ld |
@@ -52,7 +52,7 @@ It converts a traditionally slow, intuition-based process into a transparent, in
 
 ---
 
-## 🧭 How to Use
+## How to Use
 1. Upload your **airfoil** file (`.dat` or `.txt`) and optionally a **polar** file.  
 2. Choose an optimization **objective**.  
 3. Adjust parameters (Top-k slider, deterministic mode, AoA sweep).  
@@ -61,7 +61,7 @@ It converts a traditionally slow, intuition-based process into a transparent, in
 
 ---
 
-## ⚙️ System Overview
+## System Overview
 - **Selector Model:** MLP trained on 500+ generated wings, each labeled with aerodynamic metrics (CL, CD, L/D)  
 - **Validation:** Deterministic scoring and strip-theory consistency checks  
 - **LLM Wrapper:** Qwen2.5-1.5B-Instruct, constrained via structured JSON prompt to prevent hallucination  
@@ -69,7 +69,7 @@ It converts a traditionally slow, intuition-based process into a transparent, in
 
 ---
 
-## 📚 References & Credits
+## References & Credits
 Developed by **Emily Copus** and **Kevin Kyi**  
 *Carnegie Mellon University — 24-679 Designing and Deploying AI/ML Systems*  
 Instructor: **Dr. Chris McComb**
