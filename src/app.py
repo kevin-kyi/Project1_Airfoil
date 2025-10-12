@@ -8,16 +8,16 @@
 #  • Scores candidates with the selector and returns the best
 #  • Renders a static PNG, an interactive 3D mesh, exports an ASCII STL
 #  • Returns a JSON summary + (NEW) quick validation from the polar
-#  • (Existing) Optional Top-k table + parallel-coordinates plot
-#  • (NEW) LLM explanation that compares the best to top-k rivals
+#  • Optional Top-k table + parallel-coordinates plot
+#  • LLM explanation that compares the best to top-k rivals
 # ----------------------------------------------------------------------
 
 import os, sys, io, math, json, importlib, subprocess, tempfile, hashlib
 from typing import Tuple, Dict, List, Optional
 
 # ========================= USER CONFIG =========================
-MODEL_REPO_ID   = "ecopus/wing-selector-mlp"   # <-- your Hub model repo
-HF_TOKEN        = None  # paste token here if the model is private; else leave None for public
+MODEL_REPO_ID   = "ecopus/wing-selector-mlp"   
+HF_TOKEN        = None  
 APP_TITLE       = "Transport Wing Selector"
 APP_DESC        = "Upload a novel airfoil & polar. Choose an objective. Get the best wing + PNG/STL + interactive 3D + validation."
 N_CANDIDATES    = 160   # number of candidate wings to generate & score
@@ -30,10 +30,10 @@ ROOT_CHORD_MIN_M= 0.4572  # 18 in
 ROOT_CHORD_MAX_M= 0.9144  # 36 in
 TAPER_MIN       = 0.25
 TAPER_MAX       = 0.50
-TWIST_ROOT_MIN  = 0.0     # deg
-TWIST_ROOT_MAX  = 2.0     # deg
-TWIST_TIP_MIN   = -6.0    # deg
-TWIST_TIP_MAX   = -2.0    # deg
+TWIST_ROOT_MIN  = 0.0     
+TWIST_ROOT_MAX  = 2.0     
+TWIST_TIP_MIN   = -6.0    
+TWIST_TIP_MAX   = -2.0    
 
 # Validation defaults
 ALPHA_MIN_DEG   = -6.0
@@ -235,7 +235,7 @@ def resample_closed_perimeter(xb: np.ndarray, yb: np.ndarray, n: int = 256) -> T
     xy = np.stack([xb, yb], axis=1)
     dif = np.diff(xy, axis=0, append=xy[:1])
     seg = np.linalg.norm(dif, axis=1)
-    s = np.concatenate([[0], np.cumsum(seg)])  # length M+1
+    s = np.concatenate([[0], np.cumsum(seg)])  
     s = s[:-1]
     total = s[-1] + seg[-1]
     t = np.linspace(0, total, n, endpoint=False)
@@ -1012,5 +1012,4 @@ with gr.Blocks(title=APP_TITLE) as demo:
 if __name__ == "__main__":
     if HF_TOKEN and not os.getenv("HF_TOKEN"):
         os.environ["HF_TOKEN"] = HF_TOKEN
-    # Colab tip: if 7860 is busy, set server_port=None to let Gradio pick a free port
     demo.launch(server_name="0.0.0.0", server_port=7860, inbrowser=True, share=True)
